@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Badger & Dodo sample cloud deployment (B9MG210 CA1). A three-tier
+  wholesale ordering portal: Application Load Balancer -> EC2 Auto Scaling
+  group running Docker containers (web + nginx) -> Amazon RDS for MySQL, with
+  an Amazon S3 bucket for roast and dispatch exports. Designed for eu-west-1 in
+  production; runs unchanged in us-east-1 for the AWS Academy Learner Lab.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: badger-dodo
+    AllowedPattern: "[a-z][a-z0-9-]{2,20}"
+  GitRepoUrl:
+    Type: String
+    Description: HTTPS clone URL of the project repository (e.g. https://github.com/owner/badger-dodo-cloud.git)
+  GitBranch:
+    Type: String
+    Default: main
+  GitToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional GitHub token (read-only) if the repository is private. Leave blank for a public repo.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t4g.micro, db.t3.small]
+  MultiAZDatabase:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: true for production (standby in a second AZ); false keeps Learner Lab costs low.
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 4
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Existing instance profile (AWS Academy provides LabInstanceProfile).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  UseToken: !Not [!Equals [!Ref GitToken, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-igw"}]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.30.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-a"}]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.30.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-b"}]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.30.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-a"}]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.30.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-b"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-public-rt"}]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private subnets have no route to the internet: the database is unreachable from outside the VPC.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-private-rt"}]
+
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ------------------------------------------------------- Security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-alb-sg"}]
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only the load balancer may reach the app instances
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref AlbSecurityGroup}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-app-sg"}]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only the app instances may reach MySQL
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSecurityGroup}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-db-sg"}]
+
+  # ---------------------------------------------------------------- Data
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: RDS master credentials, generated at deploy time
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "badgeradmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the orders database
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-orders-db"
+      Engine: mysql
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp2
+      StorageEncrypted: true
+      MultiAZ: !Ref MultiAZDatabase
+      DBName: badgerdodo
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-orders-db"}]
+
+  ExportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-old-exports
+            Status: Enabled
+            Transitions:
+              - {StorageClass: GLACIER_IR, TransitionInDays: 90}
+      Tags: [{Key: Name, Value: !Sub "${ProjectName}-exports"}]
+
+  # ------------------------------------------------------------- Compute
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-app"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Name: !Ref InstanceProfileName}
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        Monitoring: {Enabled: true}
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 only
+          HttpPutResponseHopLimit: 2    # lets containers read instance metadata
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: !Sub "${ProjectName}-app"}]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee /var/log/badger-bootstrap.log) 2>&1
+              dnf install -y docker git jq
+              systemctl enable --now docker
+
+              REPO="${GitRepoUrl}"
+              if [ "${UseToken}" = "true" ]; then
+                REPO="https://x-access-token:${GitToken}@${!REPO#https://}"
+              fi
+              git clone --depth 1 --branch "${GitBranch}" "$REPO" /opt/badger
+
+              SECRET=$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+                --secret-id "${DbSecret}" --query SecretString --output text)
+              umask 077
+              cat > /opt/badger/app.env <<EOF
+              DB_HOST=${DbHost}
+              DB_NAME=badgerdodo
+              DB_USER=$(echo "$SECRET" | jq -r .username)
+              DB_PASSWORD=$(echo "$SECRET" | jq -r .password)
+              S3_BUCKET=${ExportsBucket}
+              AWS_REGION=${AWS::Region}
+              ENABLE_STRESS=true
+              EOF
+              sed -i 's/^ *//' /opt/badger/app.env
+
+              docker network create badger
+              docker build -t badger-web /opt/badger/app
+              docker run -d --name web --network badger --restart always \
+                --env-file /opt/badger/app.env badger-web
+              docker run -d --name proxy --network badger --restart always -p 80:80 \
+                -v /opt/badger/deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro \
+                nginx:1.27-alpine
+            - DbHost: !GetAtt Database.Endpoint.Address
+              UseToken: !If [UseToken, "true", "false"]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: "200"}
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PublicDefaultRoute, PublicSubnetARoutes, PublicSubnetBRoutes]
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-asg"
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 420
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName, PropagateAtLaunch: true}
+
+  CpuTargetTracking:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 300
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+Outputs:
+  PortalUrl:
+    Description: Open this in a browser
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  HealthUrl:
+    Value: !Sub "http://${LoadBalancer.DNSName}/health"
+  ExportsBucketName:
+    Value: !Ref ExportsBucket
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
